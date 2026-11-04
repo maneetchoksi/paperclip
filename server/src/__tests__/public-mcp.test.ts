@@ -6,7 +6,7 @@ import { projectRoutes } from "../routes/projects.js";
 import { agentRoutes } from "../routes/agents.js";
 import { companySkillRoutes } from "../routes/company-skills.js";
 import { MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
-import { mcpAttachmentUploads, mcpFileTickets, principalPermissionGrants, heartbeatRuns, issueAccessGrants } from "@paperclipai/db";
+import { mcpAttachmentUploads, mcpFileTickets, principalPermissionGrants, heartbeatRuns, issueAccessGrants, projects, projectAccessMembers } from "@paperclipai/db";
 import { createHmac, createHash, randomBytes, randomUUID } from "node:crypto";
 import express, { type Request } from "express";
 import request from "supertest";
@@ -847,6 +847,88 @@ describe.skipIf(!support.supported)("public MCP OAuth and tool boundary", () => 
       expect(await db.select().from(agents).where(eq(agents.companyId, f.company.id))).toHaveLength(0);
     } finally { await f.cleanup(); }
   });
+
+  it("imports skills only from GitHub sources through the normal import route", async () => {
+    const f = await expandedFixture(true);
+    try {
+      const imports: unknown[] = [];
+      // GitHub reads are network-bound; observe the dispatched import and delegate everything else.
+      const execute = createPublicMcpExecutor(db, oauth, async (p, method, path, body) => {
+        if (method === "POST" && path === `/companies/${f.company.id}/skills/import`) {
+          imports.push(body);
+          return { imported: [{ id: randomUUID(), name: "PDF", slug: "pdf", key: "anthropics/skills/pdf", markdown: "# PDF", sourceType: "github", sourceLocator: "https://github.com/anthropics/skills" }], warnings: ["Pinned to main"] };
+        }
+        return f.dispatch(p, method, path, body);
+      });
+      const call = (source: string) => execute(f.tokens.access_token, "paperclip_import_skills", { companyId: f.company.id, requestId: randomUUID(), source });
+      for (const source of ["https://github.com/anthropics/skills/tree/main/skills/pdf", "https://www.github.com/anthropics/skills", "https://skills.sh/anthropics/skills/pdf", "anthropics/skills", "anthropics/skills/pdf"]) {
+        expect(await call(source)).toEqual({ imported: [{ id: expect.any(String), name: "PDF", slug: "pdf", key: "anthropics/skills/pdf", sourceType: "github", sourceLocator: "https://github.com/anthropics/skills" }], warnings: ["Pinned to main"] });
+      }
+      expect(imports).toEqual(["https://github.com/anthropics/skills/tree/main/skills/pdf", "https://www.github.com/anthropics/skills", "https://skills.sh/anthropics/skills/pdf", "anthropics/skills", "anthropics/skills/pdf"].map(source => ({ source })));
+      for (const source of ["/etc/paperclip", "./skills", "../repo/skills", "~/skills", "../..", "file:///etc/passwd", "http://github.com/a/b", "https://example.com/SKILL.md", "https://raw.githubusercontent.com/a/b/main/SKILL.md", "https://github.com.evil.example/a/b", "https://user:pw@github.com/a/b", "npx skills add a/b"]) {
+        await expect(call(source), source).rejects.toThrow();
+      }
+      expect(imports).toHaveLength(5);
+    } finally { await f.cleanup(); }
+  });
+
+  it("requires configuration consent to import skills", async () => {
+    const f = await expandedFixture();
+    try {
+      await expect(f.call("paperclip_import_skills", { requestId: randomUUID(), source: "anthropics/skills" })).rejects.toThrow("paperclip:configure");
+    } finally { await f.cleanup(); }
+  });
+
+  it("assigns skills to a hired agent and adds it to a private project", async () => {
+    const f = await expandedFixture(true);
+    try {
+      await db.insert(principalPermissionGrants).values({ companyId: f.company.id, principalType: "user", principalId: f.actor.userId!, permissionKey: "agents:create" });
+      await db.update(companies).set({ requireBoardApprovalForNewAgents: false }).where(eq(companies.id, f.company.id));
+      const research = (await f.call("paperclip_create_skill", { requestId: randomUUID(), skill: { name: "Deep research", slug: "deep-research", markdown: "# Deep research" } })).skill as { key: string };
+      const writing = (await f.call("paperclip_create_skill", { requestId: randomUUID(), skill: { name: "Report writing", slug: "report-writing", markdown: "# Report writing" } })).skill as { key: string };
+      const hired = await f.call("paperclip_create_agent", { requestId: randomUUID(), agent: { name: "Analyst", role: "researcher", adapterType: "claude_local", desiredSkills: ["deep-research"] } });
+      const agentId = (hired.agent as { id: string }).id;
+      expect(hired.agent).toMatchObject({ desiredSkills: [research.key] });
+
+      // Paperclip's required built-in skills stay assigned; only company skills are chosen here.
+      const set = async (mode: string, skills: string[]) => {
+        const result = await f.call("paperclip_set_agent_skills", { agentId, requestId: randomUUID(), mode, skills });
+        return { ...result, desiredSkills: (result.desiredSkills as string[] | undefined)?.filter(k => k.startsWith("company/")) };
+      };
+      expect(await set("add", ["report-writing"])).toMatchObject({ agentId, desiredSkills: [research.key, writing.key] });
+      expect((await f.call("paperclip_get_agent", { agentId })).agent).toMatchObject({ desiredSkills: expect.arrayContaining([research.key, writing.key]) });
+      expect(await set("remove", [research.key])).toMatchObject({ desiredSkills: [writing.key] });
+      expect(await set("replace", [])).toMatchObject({ desiredSkills: [] });
+      // Like the Skills UI, unknown selections are kept but reported so the caller can correct them.
+      const unknown = await set("add", ["no-such-skill"]);
+      expect(unknown.skills).toContainEqual(expect.objectContaining({ key: "no-such-skill", state: "missing" }));
+      expect(unknown.warnings).toEqual([expect.stringContaining("no-such-skill")]);
+      expect(await set("remove", ["no-such-skill"])).toMatchObject({ skills: expect.not.arrayContaining([expect.objectContaining({ key: "no-such-skill" })]) });
+      await expect(set("add", [])).rejects.toThrow();
+      // PATCH does not apply skill selections, so the update tool must not accept them silently.
+      await expect(f.call("paperclip_update_agent", { agentId, requestId: randomUUID(), changes: { desiredSkills: ["deep-research"] } })).rejects.toThrow();
+      const logs = await db.select().from(activityLog).where(eq(activityLog.entityId, agentId));
+      expect(logs.some(v => v.actorType === "user" && v.actorId === f.actor.userId && v.action === "agent.skills_synced")).toBe(true);
+
+      const project = (await f.call("paperclip_create_project", { requestId: randomUUID(), project: { name: "Market study" } })).project as { id: string };
+      await db.update(projects).set({ visibility: "private", privacyOwnerUserId: f.actor.userId }).where(eq(projects.id, project.id));
+      // As when a person makes a project private in Paperclip: its owner keeps access.
+      await db.insert(projectAccessMembers).values({ companyId: f.company.id, projectId: project.id, subjectType: "user", subjectId: f.actor.userId! });
+      const added = await f.call("paperclip_add_project_agent", { projectId: project.id, agentId, requestId: randomUUID() });
+      expect(added).toMatchObject({ member: { projectId: project.id, subjectType: "agent", subjectId: agentId } });
+      const members = await db.select().from(projectAccessMembers).where(eq(projectAccessMembers.projectId, project.id));
+      expect(members.some(m => m.subjectType === "agent" && m.subjectId === agentId)).toBe(true);
+      expect(await f.call("paperclip_add_project_agent", { projectId: project.id, agentId: randomUUID(), requestId: randomUUID() })).toMatchObject({ outcome: "rejected", status: 422 });
+    } finally { await f.cleanup(); }
+  });
+
+  it.skipIf(!process.env.PAPERCLIP_TEST_GITHUB_NETWORK)("imports a public GitHub skill end to end", async () => {
+    const f = await expandedFixture(true);
+    try {
+      const result = await f.call("paperclip_import_skills", { requestId: randomUUID(), source: "https://github.com/anthropics/skills/tree/main/skills/pdf" });
+      expect(result, JSON.stringify(result)).toMatchObject({ imported: [expect.objectContaining({ slug: "pdf" })] });
+    } finally { await f.cleanup(); }
+  }, 120000);
 
   it("rejects unchecked legacy prompt edits through named and generic operations", async () => {
     const f = await expandedFixture(true);

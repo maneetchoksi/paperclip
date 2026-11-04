@@ -17,15 +17,17 @@ const taskChanges = updateIssueSchema.pick({ title: true, description: true, ass
   title: z.string().trim().min(1).max(240).optional(), description: z.string().max(524288).nullable().optional(),
   assigneeAgentId: z.uuid().nullable().optional(), blockedByIssueIds: z.array(z.uuid()).max(100).optional(),
 }).strict();
-const agentChanges = updateAgentSchema.pick({ name: true, role: true, title: true, icon: true, reportsTo: true, capabilities: true, desiredSkills: true, budgetMonthlyCents: true }).extend({
+// Skill selections are omitted: PATCH /agents/:id does not apply them. Use paperclip_set_agent_skills.
+const agentChanges = updateAgentSchema.pick({ name: true, role: true, title: true, icon: true, reportsTo: true, capabilities: true, budgetMonthlyCents: true }).extend({
   adapterConfig: z.object({ model: z.string().trim().min(1).max(256).optional(), reasoningEffort: z.enum(["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]).optional() }).strict().optional(),
   runtimeConfig: z.object({ aiConnection: aiRuntimeConnectionBindingSchema }).strict().optional(),
 }).strict();
 // Hires are limited to managed local harnesses configured only by model and effort:
 // a board actor is not subject to the agent-key host-command guards, so commands,
 // env, cwd and process/http adapters must never be reachable from an assistant.
-const agentHire = createAgentHireSchema.pick({ role: true, title: true, icon: true, reportsTo: true, capabilities: true, desiredSkills: true, budgetMonthlyCents: true }).extend({
+const agentHire = createAgentHireSchema.pick({ role: true, title: true, icon: true, reportsTo: true, capabilities: true, budgetMonthlyCents: true }).extend({
   name: z.string().trim().min(1).max(200),
+  desiredSkills: z.array(z.string().trim().min(1).max(300)).max(100).optional().describe("Skill keys or slugs from paperclip_list_skills or paperclip_import_skills."),
   adapterType: z.enum(["codex_local", "claude_local"]).describe("Agent harness. Use the adapterType of an existing agent from paperclip_get_agent when unsure."),
   adapterConfig: agentChanges.shape.adapterConfig,
   runtimeConfig: agentChanges.shape.runtimeConfig,
@@ -35,13 +37,29 @@ const skillMetadata = companySkillUpdateSchema.unwrap().pick({ description: true
 const deliverableFields = { type: true, provider: true, externalId: true, title: true, url: true, status: true, isPrimary: true, summary: true } as const;
 // Approval decisions are not exposed by changing a work product's review state/status.
 const deliverableStatus = z.enum(["active", "ready_for_review", "closed", "failed", "archived", "draft"]);
-const agentFields = ["id", "companyId", "name", "role", "title", "icon", "status", "reportsTo", "capabilities", "desiredSkills", "budgetMonthlyCents", "adapterType"];
+const agentFields = ["id", "companyId", "name", "role", "title", "icon", "status", "reportsTo", "capabilities", "budgetMonthlyCents", "adapterType"];
 const projectOutputFields = ["id", "companyId", "name", "description", "status", "leadAgentId", "goalIds", "targetDate", "color", "icon", "repositories"];
 const workFields = ["id", "issueId", "type", "provider", "externalId", "title", "url", "status", "isPrimary", "summary", "metadata", "updatedAt"];
+// Only sources that resolve to public github.com repositories. Local paths would read the
+// server's filesystem and other hosts would make Paperclip fetch arbitrary URLs.
+const gitHubName = "[A-Za-z0-9][A-Za-z0-9_.-]*";
+const skillSource = z.string().trim().max(2048).regex(
+  new RegExp(`^(?:https://(?:www\\.)?(?:github\\.com|skills\\.sh)/${gitHubName}/${gitHubName}(?:/[^\\s?#]*)?|${gitHubName}/${gitHubName}(?:/${gitHubName})?)$`, "i"),
+  "Use a https://github.com repository, folder or SKILL.md URL, a https://skills.sh URL, or owner/repo[/skill]",
+).describe("A GitHub repository, folder or SKILL.md URL such as https://github.com/owner/repo/tree/main/skills/name, a https://skills.sh/owner/repo/skill URL, or owner/repo[/skill].");
+const skillSelection = z.array(z.string().trim().min(1).max(300)).max(100);
 const skillFields = ["id", "companyId", "name", "slug", "key", "description", "markdown", "versionId", "currentVersionId", "latestVersionId", "categories", "tagline", "iconUrl", "color", "authorName", "homepageUrl", "sharingScope", "updatedAt"];
+const importedSkillFields = ["id", "name", "slug", "key", "description", "sourceType", "sourceLocator", "currentVersionId", "categories"];
+/** Skill keys assigned to the agent (adapterConfig.paperclipSkillSync), without other adapter settings. */
+function desiredSkillKeys(config: Record<string, unknown>) {
+  return rows(object(config.paperclipSkillSync).desiredSkills).flatMap(v => {
+    const key = typeof v === "string" ? v : object(v).key;
+    return typeof key === "string" && key ? [key] : [];
+  });
+}
 function agentOutput(value: unknown) {
   const v = object(value);
-  return { ...pick(v, agentFields), adapterConfig: mcpAgentModelConfig(String(v.adapterType), object(v.adapterConfig)), runtimeConfig: pick(v.runtimeConfig, ["aiConnection"]) };
+  return { ...pick(v, agentFields), desiredSkills: desiredSkillKeys(object(v.adapterConfig)), adapterConfig: mcpAgentModelConfig(String(v.adapterType), object(v.adapterConfig)), runtimeConfig: pick(v.runtimeConfig, ["aiConnection"]) };
 }
 function projectOutput(value: unknown) {
   const v = object(value);
@@ -115,12 +133,12 @@ export const expandedMcpCapabilities: Capability[] = [
   },
   {
     name: "paperclip_update_agent", configure: true, destructive: true,
-    description: "Update an existing agent's identity, reporting line, selected skills, model, budget, or binding to an existing AI connection. Requires configuration consent. Does not change credentials, execution commands or permission policies. New settings affect future execution.",
+    description: "Update an existing agent's identity, reporting line (reportsTo, which places it in a manager's team), model, budget, or binding to an existing AI connection. To change its skills use paperclip_set_agent_skills. Requires configuration consent. Does not change credentials, execution commands or permission policies. New settings affect future execution.",
     schema: z.object({ ...agent, requestId, changes: nonempty(agentChanges) }).strict(), run: async (p, a, api) => ({ agent: agentOutput(await api(p, "PATCH", `/agents/${pathId(a.agentId)}`, a.changes)) }),
   },
   {
     name: "paperclip_create_agent", configure: true,
-    description: "Hire a new agent with a role, reporting line, skills, model, budget and an existing AI connection. Requires configuration consent and normal agent-creation permission. If the company requires board approval for new agents, this creates a pending hire approval that must be decided in Paperclip before the agent can run. Set instructions afterwards with paperclip_update_agent_instructions.",
+    description: "Hire a new agent with a role, reporting line (reportsTo puts it in a manager's team), skills (keys or slugs from paperclip_list_skills or paperclip_import_skills), model, budget and an existing AI connection. Requires configuration consent and normal agent-creation permission. If the company requires board approval for new agents, this creates a pending hire approval that must be decided in Paperclip before the agent can run. Set instructions afterwards with paperclip_update_agent_instructions.",
     schema: z.object({ ...company, requestId, agent: agentHire }).strict(),
     run: async (p, a, api, origin) => {
       const { adapterConfig: requested = {}, ...hire } = object(a.agent);
@@ -137,6 +155,20 @@ export const expandedMcpCapabilities: Capability[] = [
       return {
         agent: agentOutput(result.agent),
         approval: approval ? { ...pick(approval, ["id", "type", "status"]), url: origin + "/" + pathId(p.company.issuePrefix) + "/approvals/" + pathId(approval.id) } : null,
+      };
+    },
+  },
+  {
+    name: "paperclip_set_agent_skills", configure: true, destructive: true,
+    description: "Assign organization skills to an agent. mode \"add\" or \"remove\" changes only the listed skills; \"replace\" sets the complete list (an empty list removes all). Use keys or slugs from paperclip_list_skills or paperclip_import_skills. Requires configuration consent and permission to update the agent. Takes effect on the agent's next run.",
+    schema: z.object({ ...agent, requestId, mode: z.enum(["add", "remove", "replace"]), skills: skillSelection }).strict().refine(v => v.mode === "replace" || v.skills.length > 0, "List at least one skill to add or remove"),
+    run: async (p, a, api) => {
+      const snapshot = object(await api(p, "POST", `/agents/${pathId(a.agentId)}/skills/sync`, { mode: a.mode, desiredSkills: a.skills }));
+      const desired = rows(snapshot.desiredSkills).filter((v): v is string => typeof v === "string");
+      return {
+        agentId: a.agentId, desiredSkills: desired,
+        skills: rows(snapshot.entries).filter(v => desired.includes(String(object(v).key))).map(v => pick(v, ["key", "runtimeName", "state"])),
+        warnings: rows(snapshot.warnings),
       };
     },
   },
@@ -171,6 +203,12 @@ export const expandedMcpCapabilities: Capability[] = [
     run: async (p, a, api) => ({ project: projectOutput(await api(p, "PATCH", `/projects/${pathId(a.projectId)}`, a.changes)) }),
   },
   {
+    name: "paperclip_add_project_agent", configure: true,
+    description: "Give an agent access to a private project so it can see and work on that project's tasks. Open projects need no membership. To put an agent to work on a project, also assign it tasks with paperclip_create_task (projectId and assigneeAgentId) or make it the project lead with paperclip_update_project (leadAgentId). Requires configuration consent and permission to manage the project's access.",
+    schema: z.object({ ...project, requestId, agentId: z.uuid() }).strict(),
+    run: async (p, a, api) => ({ member: pick(await api(p, "POST", `/projects/${pathId(a.projectId)}/access-members`, { subjectType: "agent", subjectId: a.agentId }), ["id", "projectId", "subjectType", "subjectId", "name"]) }),
+  },
+  {
     name: "paperclip_list_project_repositories", description: "List repository choices available to this person and organization before creating a project or changing its repositories.", schema: z.object(company).strict(),
     run: async (p, a, api) => ({ repositories: await api(p, "GET", `/companies/${pathId(a.companyId)}/project-repositories`) }),
   },
@@ -186,6 +224,15 @@ export const expandedMcpCapabilities: Capability[] = [
   {
     name: "paperclip_get_skill", description: "Read a skill's metadata and current version before editing.", schema: z.object(skill).strict(),
     run: async (p, a, api) => ({ skill: pick(await api(p, "GET", skillPath(a)), skillFields) }),
+  },
+  {
+    name: "paperclip_import_skills", configure: true,
+    description: "Import organization skills from GitHub, like Skills > Import in Paperclip. Accepts a public repository, folder or SKILL.md link, a skills.sh link, or owner/repo[/skill]; a repository link imports every SKILL.md in it. Importing the same repository again refreshes it. Requires configuration consent and normal skill-import policy. Assign the returned keys with paperclip_set_agent_skills.",
+    schema: z.object({ ...company, requestId, source: skillSource }).strict(),
+    run: async (p, a, api) => {
+      const result = object(await api(p, "POST", `${skillBase(a)}/import`, { source: a.source }));
+      return { imported: rows(result.imported).map(v => pick(v, importedSkillFields)), warnings: rows(result.warnings) };
+    },
   },
   {
     name: "paperclip_create_skill", configure: true, description: "Create an organization skill with Markdown instructions. Requires configuration consent and normal skill policy. Does not enable public sharing.",
