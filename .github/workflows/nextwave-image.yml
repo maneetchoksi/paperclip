@@ -1,0 +1,100 @@
+# Next Wave fork: build the self-hosted production image for our VPS.
+#
+# The `nextwave` branch is upstream's release commit plus our patches. This
+# builds it natively on arm64 (the VPS architecture) and publishes to
+# ghcr.io/<owner>/paperclip with immutable tags:
+#   <upstream-version>-nw-<short-sha>  e.g. 2026.1023.0-nw-1a2b3c4  (pin this)
+#   sha-<short-sha>
+#   nextwave                            (moving; never pin)
+name: Next Wave image
+
+on:
+  push:
+    branches: [nextwave]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: nextwave-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository != 'paperclipai/paperclip'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Compute version and tags
+        id: v
+        run: |
+          set -euo pipefail
+          # Upstream tags are fetched into the fork by scripts/update-paperclip-fork.sh.
+          base="$(git describe --tags --match 'v[0-9]*' --abbrev=0 2>/dev/null || echo v0.0.0)"
+          short="$(git rev-parse --short=7 HEAD)"
+          echo "version=${base#v}-nw-${short}" >> "$GITHUB_OUTPUT"
+          echo "build_version=$(git describe --tags --match 'v[0-9]*' --long 2>/dev/null || true)" >> "$GITHUB_OUTPUT"
+          echo "short=${short}" >> "$GITHUB_OUTPUT"
+          echo "epoch=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+          last=$(ls packages/db/src/migrations/*.sql | sed 's|.*/||' | LC_ALL=C sort | tail -1)
+          count=$(ls packages/db/src/migrations/*.sql | wc -l | tr -d ' ')
+          echo "last_migration=${last}" >> "$GITHUB_OUTPUT"
+          echo "migration_count=${count}" >> "$GITHUB_OUTPUT"
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+          run_install: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Refresh lockfile for Docker build context
+        run: pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
+
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          docker system prune -af || true
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: production
+          platforms: linux/arm64
+          push: true
+          build-args: |
+            PAPERCLIP_BUILD_VERSION=${{ steps.v.outputs.build_version }}
+            PAPERCLIP_BUILD_COMMIT=${{ github.sha }}
+            CLI_TOOLS_CACHE_EPOCH=${{ steps.v.outputs.epoch }}
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ steps.v.outputs.version }}
+            ghcr.io/${{ github.repository }}:sha-${{ steps.v.outputs.short }}
+            ghcr.io/${{ github.repository }}:nextwave
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.v.outputs.version }}
+            io.github.paperclipai.schema.last-migration=${{ steps.v.outputs.last_migration }}
+            io.github.paperclipai.schema.migration-count=${{ steps.v.outputs.migration_count }}
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache-arm64
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache-arm64,mode=max
+
+      - name: Summary
+        run: echo "Pin in vps/services/paperclip/docker-compose.yml → ghcr.io/${{ github.repository }}:${{ steps.v.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
