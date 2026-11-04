@@ -812,6 +812,42 @@ describe.skipIf(!support.supported)("public MCP OAuth and tool boundary", () => 
     } finally { await f.cleanup(); }
   });
 
+  it("hires agents through the approval-aware route and rejects host configuration", async () => {
+    const f = await expandedFixture(true);
+    try {
+      await db.insert(principalPermissionGrants).values({ companyId: f.company.id, principalType: "user", principalId: f.actor.userId!, permissionKey: "agents:create" });
+      await db.update(companies).set({ requireBoardApprovalForNewAgents: false }).where(eq(companies.id, f.company.id));
+      const hire = { name: "Researcher", role: "researcher", title: "Market research", budgetMonthlyCents: 500, adapterType: "codex_local", adapterConfig: { model: "gpt-5.4", reasoningEffort: "low" } };
+      const created = await f.call("paperclip_create_agent", { requestId: randomUUID(), agent: hire });
+      expect(created, JSON.stringify(created)).toMatchObject({ agent: { name: "Researcher", role: "researcher", adapterType: "codex_local", adapterConfig: { model: "gpt-5.4", reasoningEffort: "low" } }, approval: null });
+      const stored = (await db.select().from(agents).where(eq(agents.id, (created.agent as { id: string }).id)))[0]!;
+      expect(stored).toMatchObject({ status: "paused", lifecycleState: "preparing" });
+      expect(stored.adapterConfig.modelReasoningEffort).toBe("low");
+      expect(stored.adapterConfig.reasoningEffort).toBeUndefined();
+      expect(stored.budgetMonthlyCents).toBe(500);
+      const logs = await db.select().from(activityLog).where(eq(activityLog.entityId, stored.id));
+      expect(logs.some(v => v.actorType === "user" && v.actorId === f.actor.userId && v.action === "agent.hire_created")).toBe(true);
+
+      await db.update(companies).set({ requireBoardApprovalForNewAgents: true }).where(eq(companies.id, f.company.id));
+      const pending = await f.call("paperclip_create_agent", { requestId: randomUUID(), agent: { ...hire, name: "Pending" } });
+      expect(pending, JSON.stringify(pending)).toMatchObject({ agent: { name: "Pending", status: "pending_approval" }, approval: { type: "hire_agent", status: "pending" } });
+      expect((pending.approval as { url: string }).url).toContain("/approvals/");
+
+      expect(await f.call("paperclip_create_agent", { requestId: randomUUID(), agent: { ...hire, adapterConfig: { model: "gpt-5.4", reasoningEffort: "ultra" } } })).toMatchObject({ outcome: "rejected", status: 422 });
+      for (const agent of [{ ...hire, adapterType: "process" }, { ...hire, adapterConfig: { command: "evil" } }, { ...hire, permissions: {} }, { ...hire, runtimeConfig: { debug: { providerTrace: "raw" } } }]) {
+        await expect(f.call("paperclip_create_agent", { requestId: randomUUID(), agent })).rejects.toThrow();
+      }
+    } finally { await f.cleanup(); }
+  });
+
+  it("requires configuration consent to hire agents", async () => {
+    const f = await expandedFixture();
+    try {
+      await expect(f.call("paperclip_create_agent", { requestId: randomUUID(), agent: { name: "Nope", adapterType: "codex_local" } })).rejects.toThrow("paperclip:configure");
+      expect(await db.select().from(agents).where(eq(agents.companyId, f.company.id))).toHaveLength(0);
+    } finally { await f.cleanup(); }
+  });
+
   it("rejects unchecked legacy prompt edits through named and generic operations", async () => {
     const f = await expandedFixture(true);
     try {

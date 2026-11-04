@@ -1,7 +1,7 @@
 import { z } from "zod";
-import { mcpAgentModelConfig } from "./agent-config.js";
+import { applyMcpReasoningEffort, mcpAgentModelConfig } from "./agent-config.js";
 import {
-  updateIssueSchema, upsertIssueDocumentSchema, updateAgentSchema, upsertAgentInstructionsFileSchema,
+  createAgentHireSchema, updateIssueSchema, upsertIssueDocumentSchema, updateAgentSchema, upsertAgentInstructionsFileSchema,
   aiRuntimeConnectionBindingSchema, createProjectSchema, updateProjectSchema,
   companySkillCreateSchema, companySkillUpdateSchema, companySkillFileUpdateSchema,
   createIssueWorkProductSchema, updateIssueWorkProductSchema,
@@ -20,6 +20,15 @@ const taskChanges = updateIssueSchema.pick({ title: true, description: true, ass
 const agentChanges = updateAgentSchema.pick({ name: true, role: true, title: true, icon: true, reportsTo: true, capabilities: true, desiredSkills: true, budgetMonthlyCents: true }).extend({
   adapterConfig: z.object({ model: z.string().trim().min(1).max(256).optional(), reasoningEffort: z.enum(["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]).optional() }).strict().optional(),
   runtimeConfig: z.object({ aiConnection: aiRuntimeConnectionBindingSchema }).strict().optional(),
+}).strict();
+// Hires are limited to managed local harnesses configured only by model and effort:
+// a board actor is not subject to the agent-key host-command guards, so commands,
+// env, cwd and process/http adapters must never be reachable from an assistant.
+const agentHire = createAgentHireSchema.pick({ role: true, title: true, icon: true, reportsTo: true, capabilities: true, desiredSkills: true, budgetMonthlyCents: true }).extend({
+  name: z.string().trim().min(1).max(200),
+  adapterType: z.enum(["codex_local", "claude_local"]).describe("Agent harness. Use the adapterType of an existing agent from paperclip_get_agent when unsure."),
+  adapterConfig: agentChanges.shape.adapterConfig,
+  runtimeConfig: agentChanges.shape.runtimeConfig,
 }).strict();
 const projectFields = { name: true, description: true, status: true, leadAgentId: true, goalIds: true, targetDate: true, color: true, icon: true } as const;
 const skillMetadata = companySkillUpdateSchema.unwrap().pick({ description: true, iconUrl: true, color: true, tagline: true, authorName: true, homepageUrl: true, categories: true }).strict();
@@ -108,6 +117,28 @@ export const expandedMcpCapabilities: Capability[] = [
     name: "paperclip_update_agent", configure: true, destructive: true,
     description: "Update an existing agent's identity, reporting line, selected skills, model, budget, or binding to an existing AI connection. Requires configuration consent. Does not change credentials, execution commands or permission policies. New settings affect future execution.",
     schema: z.object({ ...agent, requestId, changes: nonempty(agentChanges) }).strict(), run: async (p, a, api) => ({ agent: agentOutput(await api(p, "PATCH", `/agents/${pathId(a.agentId)}`, a.changes)) }),
+  },
+  {
+    name: "paperclip_create_agent", configure: true,
+    description: "Hire a new agent with a role, reporting line, skills, model, budget and an existing AI connection. Requires configuration consent and normal agent-creation permission. If the company requires board approval for new agents, this creates a pending hire approval that must be decided in Paperclip before the agent can run. Set instructions afterwards with paperclip_update_agent_instructions.",
+    schema: z.object({ ...company, requestId, agent: agentHire }).strict(),
+    run: async (p, a, api, origin) => {
+      const { adapterConfig: requested = {}, ...hire } = object(a.agent);
+      const model = object(requested).model;
+      let adapterConfig: Record<string, unknown>;
+      try {
+        // The hire route stores adapter-native fields; translate the neutral effort like PATCH does.
+        adapterConfig = applyMcpReasoningEffort(String(hire.adapterType), model === undefined ? {} : { model }, object(requested));
+      } catch {
+        throw new McpApiError(422, { code: "MCP_REASONING_EFFORT_UNSUPPORTED" });
+      }
+      const result = object(await api(p, "POST", `/companies/${pathId(a.companyId)}/agent-hires`, { ...hire, adapterConfig }));
+      const approval = result.approval ? object(result.approval) : null;
+      return {
+        agent: agentOutput(result.agent),
+        approval: approval ? { ...pick(approval, ["id", "type", "status"]), url: origin + "/" + pathId(p.company.issuePrefix) + "/approvals/" + pathId(approval.id) } : null,
+      };
+    },
   },
   {
     name: "paperclip_read_agent_instructions", description: "Read an agent instruction file and its revision/hash. Defaults to AGENTS.md. Use the returned revision/hash when updating.",
