@@ -250,12 +250,13 @@ describe.skipIf(!support.supported)('skill source persistence', () => {
     expect(await db.select().from(companySkills).where(eq(companySkills.companyId, legacyCompany))).toHaveLength(4);
   });
 
-  it('routes legacy folder URLs with slash-containing refs through the source importer', async () => {
+  // The live GitHub API answers 422 ("No commit found for SHA") for an unknown ref.
+  it.each([404, 422])('routes legacy folder URLs with slash-containing refs through the source importer (unknown ref %i)', async (unknownRefStatus) => {
     const isolatedCompany = randomUUID();
-    await db.insert(companies).values({ id: isolatedCompany, name: 'Compatibility', issuePrefix: 'CMP' });
+    await db.insert(companies).values({ id: isolatedCompany, name: 'Compatibility', issuePrefix: `CM${unknownRefStatus}` });
     const fixture = githubFixture({ 'deep/SKILL.md': md('compatibility'), 'elsewhere/SKILL.md': md('unselected') });
     const read = Object.assign(async (request: string) => {
-      if (request.includes('/commits/') && decodeURIComponent(request.split('/commits/')[1]!) !== 'feature/new-skills' && !request.endsWith(sha)) throw unprocessable('Not found', { status: 404 });
+      if (request.includes('/commits/') && decodeURIComponent(request.split('/commits/')[1]!) !== 'feature/new-skills' && !request.endsWith(sha)) throw unprocessable('Not found', { status: unknownRefStatus });
       return fixture(request);
     }, { openSnapshot: fixture.openSnapshot });
     const service = skillSourceService(db);

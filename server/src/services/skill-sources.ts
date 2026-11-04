@@ -235,7 +235,8 @@ export function skillSourceService(db: Db) {
           const commit = await read(`/repos/${parts[0]}/${parts[1]!.replace(/\.git$/i, '')}/commits/${encodeURIComponent(candidate)}`) as { sha: string };
           trackingRef = candidate; commitSha = commit.sha; prefix = suffix.slice(count).join('/'); break;
         } catch (error) {
-          if (!(error instanceof Error && 'details' in error && (error.details as { status?: number })?.status === 404)) throw error;
+          // GitHub answers 422 ("No commit found for SHA"), not 404, for a ref that does not exist.
+          if (!(error instanceof Error && 'details' in error && [404, 422].includes((error.details as { status?: number })?.status ?? 0))) throw error;
         }
       }
       if (!trackingRef) throw unprocessable('GitHub branch or commit was not found.');
