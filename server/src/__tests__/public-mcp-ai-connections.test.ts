@@ -2,6 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import express, { type Request } from "express";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createDb, authUsers, companies, companyMemberships, connectionGrants, principalPermissionGrants, toolApplications, toolConnections } from "@paperclipai/db";
+import { aiConnectionBindingSchema } from "@paperclipai/shared";
 import { and, eq } from "drizzle-orm";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { createPublicMcpOAuth } from "../services/public-mcp/oauth.js";
@@ -84,13 +85,26 @@ describe.skipIf(!support.supported)("public MCP AI connection tools", () => {
     return { connection: connection!, grant: grant! };
   }
 
+  /** A non-AI connection in the same company, to prove the rename tool refuses it. */
+  async function connectTool(companyId: string, ownerUserId: string, name: string) {
+    await db.insert(toolApplications).values({ companyId, applicationKey: "app-gallery:linear", name: "Linear", type: "rest_api", ownerUserId }).onConflictDoNothing();
+    const [application] = await db.select().from(toolApplications).where(and(eq(toolApplications.companyId, companyId), eq(toolApplications.applicationKey, "app-gallery:linear")));
+    const [connection] = await db.insert(toolConnections).values({
+      companyId, applicationId: application!.id, name, uid: `tool-${randomUUID()}`, connectionPurpose: "tool", transport: "rest_api",
+      status: "active", enabled: true, healthStatus: "ok", createdByUserId: ownerUserId, config: {},
+    }).returning();
+    return connection!;
+  }
+
   it("lists usable AI connections with the exact runtimeConfig.aiConnection binding and no secrets", async () => {
     const team = await company();
     const f = await fixture(team.id);
     const personal = await connect(team.id, f.userId, "My Claude key");
     const shared = await connect(team.id, f.userId, "Team Claude key", "shared");
     await connect(team.id, await person(team.id), "Colleague private key");
-    const result = await f.call("paperclip_list_ai_connections") as { connections: Array<Record<string, unknown>> };
+    const result = await f.call("paperclip_list_ai_connections") as { canManageConnections: boolean; connections: Array<Record<string, unknown>> };
+    // A member cannot attach a company-shared connection to an agent, and is told so.
+    expect(result.canManageConnections).toBe(false);
     // Another person's personal connection stays invisible to this connection.
     expect(result.connections.map((row) => row.name)).not.toContain("Colleague private key");
     expect(result.connections.sort((left, right) => String(left.name).localeCompare(String(right.name)))).toEqual([
@@ -110,6 +124,8 @@ describe.skipIf(!support.supported)("public MCP AI connection tools", () => {
     for (const forbidden of ["@example.com", "account-owner", "credential", "tenant", "applicationKey", "sourceTemplateKey", "transport"]) {
       expect(serialized).not.toContain(forbidden);
     }
+    // Every emitted binding is a valid runtimeConfig.aiConnection for create/update agent.
+    for (const row of result.connections) expect(aiConnectionBindingSchema.safeParse(row.aiConnection).success).toBe(true);
   });
 
   it("renames a connection as its creator and replays the same requestId", async () => {
@@ -141,6 +157,15 @@ describe.skipIf(!support.supported)("public MCP AI connection tools", () => {
     await db.insert(principalPermissionGrants).values({ companyId: team.id, principalType: "user", principalId: manager.userId, permissionKey: "tools:manage_connections" });
     expect(await manager.call("paperclip_rename_ai_connection", { connectionId: connection.id, name: "Managed key", requestId: randomUUID() }))
       .toMatchObject({ connection: { name: "Managed key" } });
+  });
+
+  it("refuses to rename a connection that is not an AI connection", async () => {
+    const team = await company();
+    const f = await fixture(team.id);
+    const tool = await connectTool(team.id, f.userId, "Linear");
+    expect(await f.call("paperclip_rename_ai_connection", { connectionId: tool.id, name: "Renamed file store", requestId: randomUUID() }))
+      .toMatchObject({ outcome: "rejected", status: 404 });
+    expect((await db.select().from(toolConnections).where(eq(toolConnections.id, tool.id)))[0]!.name).toBe("Linear");
   });
 
   it("rejects renaming without configuration consent, across companies and outside the name bounds", async () => {

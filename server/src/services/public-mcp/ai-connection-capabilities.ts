@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { company, object, pathId, pick, requestId, rows, type Capability } from "./contracts.js";
+import { McpApiError, company, object, pathId, pick, requestId, rows, type Capability } from "./contracts.js";
 
 /** Fields a regular company member already sees in the AI connections list. Never
  * account labels, credential references, tenant ids or provider tokens. */
@@ -19,15 +19,17 @@ function aiConnectionBinding(connection: Record<string, unknown>) {
   };
 }
 
-/** Assistant tools for the organization's AI connections. Filled in by the AI-connection package. */
+/** Assistant tools for an organization's AI connections: discover the ids an
+ * agent binding needs, and rename a connection so people can tell them apart. */
 export const aiConnectionMcpCapabilities: Capability[] = [
   {
     name: "paperclip_list_ai_connections",
-    description: "List the AI connections this person may use to run agents in the authorized company, with the current sign-in status of each. Copy one connection's aiConnection object verbatim into runtimeConfig.aiConnection of paperclip_create_agent or paperclip_update_agent to make that agent run on it; bind a company-shared connection only when this person may configure connections. Credentials are never returned; sign-in is managed in Paperclip.",
+    description: "List the AI connections this person may use to run agents in the authorized company, with the current sign-in status of each. Copy one connection's aiConnection object verbatim into runtimeConfig.aiConnection of paperclip_create_agent; paperclip_update_agent accepts it only for an agent this connection is already allowed for. Prefer a connection whose status is connected, and whose provider matches the agent's harness (Anthropic for claude_local, OpenAI for codex_local). Binding a company-shared connection to an agent also needs canManageConnections. Credentials are never returned; sign-in is managed in Paperclip.",
     schema: z.object(company).strict(),
     run: async (p, a, api) => {
       const result = object(await api(p, "GET", `/companies/${pathId(a.companyId)}/ai-connections`));
       return {
+        canManageConnections: result.canManageConnections === true,
         connections: rows(result.connections).map((value) => {
           const connection = object(value);
           return { ...pick(connection, connectionFields), aiConnection: aiConnectionBinding(connection) };
@@ -44,8 +46,13 @@ export const aiConnectionMcpCapabilities: Capability[] = [
       name: z.string().trim().min(1).max(160).describe("The exact display name people should see for this connection."),
       requestId,
     }).strict(),
-    run: async (p, a, api) => ({
-      connection: pick(await api(p, "PATCH", `/tool-connections/${pathId(a.connectionId)}`, { name: a.name }), renamedFields),
-    }),
+    run: async (p, a, api) => {
+      // PATCH /tool-connections/:connectionId accepts any connection purpose, so a
+      // mistaken id would rename an unrelated tool or channel connection. Resolve the
+      // target first and require the AI connection this company consented to.
+      const existing = object(await api(p, "GET", `/tool-connections/${pathId(a.connectionId)}`));
+      if (existing.connectionPurpose !== "ai" || existing.companyId !== a.companyId) throw new McpApiError(404);
+      return { connection: pick(await api(p, "PATCH", `/tool-connections/${pathId(a.connectionId)}`, { name: a.name }), renamedFields) };
+    },
   },
 ];
