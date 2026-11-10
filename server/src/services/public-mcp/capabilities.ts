@@ -15,6 +15,8 @@ export type { ApiDispatch } from "./contracts.js";
 import { McpApiError, McpCapabilityError, type ApiDispatch, type Capability, company, task, requestId, boundedLimit, object, pick, rows, taskFields, commentFields, documentFields, pathId, stable } from "./contracts.js";
 import { fileTransferCapabilities, type PublicMcpTransfers } from "./file-transfers.js";
 import { expandedMcpCapabilities } from "./expanded-capabilities.js";
+import { routineMcpCapabilities } from "./routine-capabilities.js";
+import { aiConnectionMcpCapabilities } from "./ai-connection-capabilities.js";
 
 /** Internal HTTP dispatch reuses domain authorization, validation, audit and scheduling.
  * Neither an arbitrary path nor an actor is accepted from the MCP client.
@@ -140,7 +142,7 @@ export const publicMcpCapabilities: Capability[] = [
       url: origin + "/" + pathId(p.company.issuePrefix) + "/approvals/" + pathId(object(v).id),
     })) }),
   },
-  ...expandedMcpCapabilities, ...fileTransferCapabilities,
+  ...expandedMcpCapabilities, ...routineMcpCapabilities, ...aiConnectionMcpCapabilities, ...fileTransferCapabilities,
 ];
 
 publicMcpCapabilities.push({
