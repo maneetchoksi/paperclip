@@ -1,12 +1,13 @@
 import { z } from "zod";
-import { applyMcpReasoningEffort, mcpAgentModelConfig } from "./agent-config.js";
+import { applyMcpReasoningEffort, mcpAgentModelConfig, MCP_AGENT_HARNESSES } from "./agent-config.js";
 import {
   createAgentHireSchema, updateIssueSchema, upsertIssueDocumentSchema, updateAgentSchema, upsertAgentInstructionsFileSchema,
   aiRuntimeConnectionBindingSchema, createProjectSchema, updateProjectSchema,
   companySkillCreateSchema, companySkillUpdateSchema, companySkillFileUpdateSchema,
   createIssueWorkProductSchema, updateIssueWorkProductSchema,
 } from "@paperclipai/shared";
-import { McpApiError, company, task, requestId, pathId, object, pick, rows, taskFields, documentFields, type Capability } from "./contracts.js";
+import { McpApiError, company, task, requestId, pathId, object, pick, rows, taskFields, documentFields, type ApiDispatch, type Capability } from "./contracts.js";
+import type { McpPrincipal } from "./oauth.js";
 
 const agent = { ...company, agentId: z.uuid() };
 const project = { ...company, projectId: z.uuid() };
@@ -18,8 +19,12 @@ const taskChanges = updateIssueSchema.pick({ title: true, description: true, ass
   assigneeAgentId: z.uuid().nullable().optional(), blockedByIssueIds: z.array(z.uuid()).max(100).optional(),
 }).strict();
 // Skill selections are omitted: PATCH /agents/:id does not apply them. Use paperclip_set_agent_skills.
+const mcpHarness = z.enum([...MCP_AGENT_HARNESSES]);
 const agentChanges = updateAgentSchema.pick({ name: true, role: true, title: true, icon: true, reportsTo: true, capabilities: true, budgetMonthlyCents: true }).extend({
-  adapterConfig: z.object({ model: z.string().trim().min(1).max(256).optional(), reasoningEffort: z.enum(["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]).optional() }).strict().optional(),
+  // "off" is Pi's lowest thinking level; codex_local and claude_local still reject the levels
+  // their own model lists do not support through applyMcpReasoningEffort.
+  adapterConfig: z.object({ model: z.string().trim().min(1).max(256).optional(), reasoningEffort: z.enum(["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]).optional() }).strict().optional(),
+  adapterType: mcpHarness.optional().describe("Harness that executes the agent: codex_local, claude_local or pi_local. Switching also requires adapterConfig.model in the same call."),
   runtimeConfig: z.object({ aiConnection: aiRuntimeConnectionBindingSchema }).strict().optional(),
 }).strict();
 // Hires are limited to managed local harnesses configured only by model and effort:
@@ -28,7 +33,7 @@ const agentChanges = updateAgentSchema.pick({ name: true, role: true, title: tru
 const agentHire = createAgentHireSchema.pick({ role: true, title: true, icon: true, reportsTo: true, capabilities: true, budgetMonthlyCents: true }).extend({
   name: z.string().trim().min(1).max(200),
   desiredSkills: z.array(z.string().trim().min(1).max(300)).max(100).optional().describe("Skill keys or slugs from paperclip_list_skills or paperclip_import_skills."),
-  adapterType: z.enum(["codex_local", "claude_local"]).describe("Agent harness. Use the adapterType of an existing agent from paperclip_get_agent when unsure."),
+  adapterType: mcpHarness.describe("Agent harness: codex_local, claude_local or pi_local (Pi). Use the adapterType of an existing agent from paperclip_get_agent when unsure."),
   adapterConfig: agentChanges.shape.adapterConfig,
   runtimeConfig: agentChanges.shape.runtimeConfig,
 }).strict();
@@ -56,6 +61,31 @@ function desiredSkillKeys(config: Record<string, unknown>) {
     const key = typeof v === "string" ? v : object(v).key;
     return typeof key === "string" && key ? [key] : [];
   });
+}
+/**
+ * Build the PATCH for an assistant-selected harness switch.
+ *
+ * A switch replaces the adapter that executes the agent, so an assistant may only move between
+ * the managed local harnesses, only with an explicit model, and never away from an adapter
+ * whose configuration could carry host commands (process, http, gateway).
+ *
+ * PATCH /agents/:id keeps the adapter-agnostic keys (env, cwd, instructions, skills) from the
+ * previous adapter, exactly like a harness switch made in the Paperclip UI: agents can hold
+ * tokens and working directories they still need afterwards. That is safe on this boundary
+ * because the assistant schema cannot set env, cwd or commands at all, so model and effort are
+ * the only values the assistant chooses here.
+ */
+async function harnessSwitch(p: McpPrincipal, agentId: unknown, changes: Record<string, unknown>, api: ApiDispatch) {
+  const current = object(await api(p, "GET", `/agents/${pathId(agentId)}/configuration`));
+  const currentType = String(current.adapterType ?? "");
+  if (String(changes.adapterType) === currentType) return changes;
+  if (!(MCP_AGENT_HARNESSES as readonly string[]).includes(currentType)) {
+    throw new McpApiError(422, { code: "MCP_HARNESS_SWITCH_UNSUPPORTED", currentAdapterType: currentType });
+  }
+  const requested = object(changes.adapterConfig);
+  const model = typeof requested.model === "string" ? requested.model.trim() : "";
+  if (!model) throw new McpApiError(422, { code: "MCP_HARNESS_SWITCH_MODEL_REQUIRED", adapterType: String(changes.adapterType) });
+  return { ...changes, adapterConfig: { ...requested, model } };
 }
 function agentOutput(value: unknown) {
   const v = object(value);
@@ -133,12 +163,16 @@ export const expandedMcpCapabilities: Capability[] = [
   },
   {
     name: "paperclip_update_agent", configure: true, destructive: true,
-    description: "Update an existing agent's identity, reporting line (reportsTo, which places it in a manager's team), model, budget, or binding to an existing AI connection. To change its skills use paperclip_set_agent_skills. Requires configuration consent. Does not change credentials, execution commands or permission policies. New settings affect future execution.",
-    schema: z.object({ ...agent, requestId, changes: nonempty(agentChanges) }).strict(), run: async (p, a, api) => ({ agent: agentOutput(await api(p, "PATCH", `/agents/${pathId(a.agentId)}`, a.changes)) }),
+    description: "Update an existing agent's identity, reporting line (reportsTo, which places it in a manager's team), model, reasoning effort, harness (adapterType: codex_local, claude_local or pi_local), budget, or binding to an existing AI connection. Switching harness needs the new model in the same call; the agent's env, working directory, instructions and assigned skills are kept. To change its skills use paperclip_set_agent_skills. Requires configuration consent. Does not change credentials, execution commands or permission policies. New settings affect future execution.",
+    schema: z.object({ ...agent, requestId, changes: nonempty(agentChanges) }).strict(), run: async (p, a, api) => {
+      const changes = object(a.changes);
+      const patch = changes.adapterType === undefined ? changes : await harnessSwitch(p, a.agentId, changes, api);
+      return { agent: agentOutput(await api(p, "PATCH", `/agents/${pathId(a.agentId)}`, patch)) };
+    },
   },
   {
     name: "paperclip_create_agent", configure: true,
-    description: "Hire a new agent with a role, reporting line (reportsTo puts it in a manager's team), skills (keys or slugs from paperclip_list_skills or paperclip_import_skills), model, budget and an existing AI connection. Requires configuration consent and normal agent-creation permission. If the company requires board approval for new agents, this creates a pending hire approval that must be decided in Paperclip before the agent can run. Set instructions afterwards with paperclip_update_agent_instructions.",
+    description: "Hire a new agent with a role, reporting line (reportsTo puts it in a manager's team), skills (keys or slugs from paperclip_list_skills or paperclip_import_skills), model, reasoning effort, harness (adapterType: codex_local, claude_local or pi_local), budget and an existing AI connection. Requires configuration consent and normal agent-creation permission. If the company requires board approval for new agents, this creates a pending hire approval that must be decided in Paperclip before the agent can run. Set instructions afterwards with paperclip_update_agent_instructions.",
     schema: z.object({ ...company, requestId, agent: agentHire }).strict(),
     run: async (p, a, api, origin) => {
       const { adapterConfig: requested = {}, ...hire } = object(a.agent);

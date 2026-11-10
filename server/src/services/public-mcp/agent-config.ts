@@ -2,12 +2,25 @@ import { codexLocalReasoningEffortsForModel, DEFAULT_CODEX_LOCAL_MODEL } from "@
 import { claudeLocalReasoningEffortsForModel, DEFAULT_CLAUDE_LOCAL_MODEL } from "@paperclipai/adapter-claude-local";
 import { unprocessable } from "../../errors.js";
 
+/**
+ * Harnesses an assistant may choose. Every entry is a managed local adapter that Paperclip
+ * configures through model and effort only; host commands, env, cwd, process adapters and
+ * http adapter endpoints stay unreachable from the assistant boundary.
+ */
+export const MCP_AGENT_HARNESSES = ["codex_local", "claude_local", "pi_local"] as const;
+
+/** Pi keeps its reasoning level in `thinking` and accepts the same levels for every model. */
+const PI_LOCAL_THINKING_LEVELS: readonly string[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+
 function effortSettings(adapterType: string, config: Record<string, unknown>) {
   if (adapterType === "codex_local" || (adapterType === "paperclip_runner" && (config.provider ?? "codex") === "codex")) {
     return { field: "modelReasoningEffort", supported: codexLocalReasoningEffortsForModel(typeof config.model === "string" ? config.model : DEFAULT_CODEX_LOCAL_MODEL) };
   }
   if (adapterType === "claude_local") {
     return { field: "effort", supported: claudeLocalReasoningEffortsForModel(typeof config.model === "string" ? config.model : DEFAULT_CLAUDE_LOCAL_MODEL) };
+  }
+  if (adapterType === "pi_local") {
+    return { field: "thinking", supported: PI_LOCAL_THINKING_LEVELS };
   }
   return { field: null, supported: [] as readonly string[] };
 }

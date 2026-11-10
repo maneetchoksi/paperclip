@@ -840,6 +840,61 @@ describe.skipIf(!support.supported)("public MCP OAuth and tool boundary", () => 
     } finally { await f.cleanup(); }
   });
 
+  it("hires Pi agents and switches an existing agent's harness from the assistant boundary", async () => {
+    const f = await expandedFixture(true);
+    try {
+      await db.insert(principalPermissionGrants).values({ companyId: f.company.id, principalType: "user", principalId: f.actor.userId!, permissionKey: "agents:create" });
+      await db.update(companies).set({ requireBoardApprovalForNewAgents: false }).where(eq(companies.id, f.company.id));
+      const piModel = "opencode-go/deepseek-v4.1-flash";
+
+      // Pi stores the assistant's neutral effort in its own `thinking` field.
+      const piHire = await f.call("paperclip_create_agent", { requestId: randomUUID(), agent: { name: "Pi builder", role: "engineer", adapterType: "pi_local", adapterConfig: { model: piModel, reasoningEffort: "high" } } });
+      const piAgentId = (piHire.agent as { id: string }).id;
+      expect(piHire, JSON.stringify(piHire)).toMatchObject({ agent: { adapterType: "pi_local", adapterConfig: { model: piModel, reasoningEffort: "high" } } });
+      const storedPi = (await db.select().from(agents).where(eq(agents.id, piAgentId)))[0]!;
+      expect(storedPi.adapterConfig.thinking).toBe("high");
+      expect(storedPi.adapterConfig.reasoningEffort).toBeUndefined();
+      expect(await f.call("paperclip_get_agent", { agentId: piAgentId })).toMatchObject({
+        agent: { adapterType: "pi_local", adapterConfig: { model: piModel, reasoningEffort: "high", supportedReasoningEfforts: ["off", "minimal", "low", "medium", "high", "xhigh"] } },
+      });
+
+      const skill = (await f.call("paperclip_create_skill", { requestId: randomUUID(), skill: { name: "Deep research", slug: "deep-research", markdown: "# Deep research" } })).skill as { key: string };
+      const claude = (await f.call("paperclip_create_agent", { requestId: randomUUID(), agent: { name: "Claude analyst", role: "researcher", adapterType: "claude_local", adapterConfig: { model: "claude-sonnet-4-5", reasoningEffort: "high" }, desiredSkills: ["deep-research"] } })).agent as { id: string; desiredSkills: string[] };
+      expect(claude.desiredSkills).toContain(skill.key);
+      // As when a person edits the agent in Paperclip: the claude adapter carries host settings
+      // (a required token in env and a working directory) that the agent still needs after a switch.
+      const claudeStored = (await db.select().from(agents).where(eq(agents.id, claude.id)))[0]!;
+      await db.update(agents).set({ adapterConfig: { ...claudeStored.adapterConfig, env: { LOYALTY_INGESTER_TOKEN: "token-keep-me" }, cwd: "/tmp/old-claude-workspace" } }).where(eq(agents.id, claude.id));
+
+      const switched = await f.call("paperclip_update_agent", { agentId: claude.id, requestId: randomUUID(), changes: { adapterType: "pi_local", adapterConfig: { model: piModel, reasoningEffort: "xhigh" } } });
+      expect(switched, JSON.stringify(switched)).toMatchObject({ agent: { adapterType: "pi_local", adapterConfig: { model: piModel, reasoningEffort: "xhigh" }, desiredSkills: expect.arrayContaining([skill.key]) } });
+      const storedSwitch = (await db.select().from(agents).where(eq(agents.id, claude.id)))[0]!;
+      expect(storedSwitch.adapterType).toBe("pi_local");
+      expect(storedSwitch.adapterConfig).toMatchObject({ model: piModel, thinking: "xhigh" });
+      // Only the harness-specific field is dropped; env, cwd and skills survive like a UI switch.
+      expect(storedSwitch.adapterConfig.effort).toBeUndefined();
+      expect(storedSwitch.adapterConfig.modelReasoningEffort).toBeUndefined();
+      expect(storedSwitch.adapterConfig.env).toEqual({ LOYALTY_INGESTER_TOKEN: { type: "plain", value: "token-keep-me" } });
+      expect(storedSwitch.adapterConfig.cwd).toBe("/tmp/old-claude-workspace");
+      // The Paperclip-owned skill assignment survives the switch.
+      expect(JSON.stringify(storedSwitch.adapterConfig)).toContain(skill.key);
+      // The assistant can never set host execution settings, on a switch or otherwise.
+      for (const changes of [{ adapterConfig: { model: piModel, env: { EVIL: "1" } } }, { adapterConfig: { model: piModel, cwd: "/tmp/evil" } }, { adapterConfig: { model: piModel, command: "evil" } }]) {
+        await expect(f.call("paperclip_update_agent", { agentId: claude.id, requestId: randomUUID(), changes }), JSON.stringify(changes)).rejects.toThrow();
+      }
+      expect((await db.select().from(agents).where(eq(agents.id, claude.id)))[0]!.adapterConfig.cwd).toBe("/tmp/old-claude-workspace");
+
+      // A switch needs the new harness model in the same call.
+      expect(await f.call("paperclip_update_agent", { agentId: claude.id, requestId: randomUUID(), changes: { adapterType: "codex_local" } })).toMatchObject({ outcome: "rejected", status: 422, code: "MCP_HARNESS_SWITCH_MODEL_REQUIRED" });
+      // An adapter the assistant cannot own (host command) cannot be switched away from either.
+      const [processAgent] = await db.insert(agents).values({ companyId: f.company.id, name: "Script runner", adapterType: "process", adapterConfig: { command: "node", args: ["-e", "1"], cwd: "/tmp/process-workspace" } }).returning();
+      expect(await f.call("paperclip_update_agent", { agentId: processAgent!.id, requestId: randomUUID(), changes: { adapterType: "pi_local", adapterConfig: { model: "deepseek/deepseek-flash" } } })).toMatchObject({ outcome: "rejected", status: 422, code: "MCP_HARNESS_SWITCH_UNSUPPORTED" });
+      expect((await db.select().from(agents).where(eq(agents.id, processAgent!.id)))[0]!).toMatchObject({ adapterType: "process", adapterConfig: expect.objectContaining({ command: "node", cwd: "/tmp/process-workspace" }) });
+      // Hires stay inside the same managed harness set.
+      await expect(f.call("paperclip_create_agent", { requestId: randomUUID(), agent: { name: "Nope", adapterType: "gemini_local" } })).rejects.toThrow();
+    } finally { await f.cleanup(); }
+  }, 120000);
+
   it("requires configuration consent to hire agents", async () => {
     const f = await expandedFixture();
     try {
