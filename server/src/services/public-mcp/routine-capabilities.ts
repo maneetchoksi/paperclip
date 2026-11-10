@@ -25,7 +25,7 @@ const triggerChanges = updateRoutineTriggerSchema.pick({ label: true, enabled: t
   cronExpression: z.string().trim().min(1).max(200).optional(),
   timezone: z.string().trim().min(1).max(100).optional(),
 }).strict().refine((value) => Object.keys(value).length > 0, "Supply at least one change");
-const runOptions = runRoutineSchema.pick({ triggerId: true, variables: true });
+const runOptions = runRoutineSchema.pick({ variables: true });
 
 const routineFields = [
   "id", "companyId", "projectId", "goalId", "parentIssueId", "title", "description", "assigneeAgentId", "priority", "status",
@@ -47,13 +47,22 @@ const routineOutput = (value: unknown) => {
   const owner = object(value);
   return {
     ...pick(owner, routineFields),
-    project: owner.project ? pick(owner.project, ["id", "name", "status"]) : null,
-    assignee: owner.assignee ? pick(owner.assignee, ["id", "name", "role", "title"]) : null,
-    triggers: scheduleTriggers(owner.triggers),
-    recentRuns: rows(owner.recentRuns).map(runOutput),
-    lastRun: owner.lastRun ? runOutput(owner.lastRun) : null,
-    activeIssue: owner.activeIssue ? pick(owner.activeIssue, issueFields) : null,
+    // A bare routines row (create/update response) carries none of these relations, and inventing an
+    // empty list there would read as "this routine has no schedule" and invite a duplicate trigger.
+    ...(owner.triggers === undefined ? {} : { triggers: scheduleTriggers(owner.triggers) }),
+    ...(owner.recentRuns === undefined ? {} : { recentRuns: rows(owner.recentRuns).map(runOutput) }),
+    ...(owner.lastRun === undefined ? {} : { lastRun: owner.lastRun ? runOutput(owner.lastRun) : null }),
+    ...(owner.activeIssue === undefined ? {} : { activeIssue: owner.activeIssue ? pick(owner.activeIssue, issueFields) : null }),
+    ...(owner.project === undefined ? {} : { project: owner.project ? pick(owner.project, ["id", "name", "status"]) : null }),
+    ...(owner.assignee === undefined ? {} : { assignee: owner.assignee ? pick(owner.assignee, ["id", "name", "role", "title"]) : null }),
   };
+};
+/** Create and update answer with a bare routine row, so re-read its detail to report schedules truthfully.
+ * The re-read is best effort: a detail that cannot be rendered must not turn a completed write into a failure. */
+const settledRoutine = async (p: McpPrincipal, saved: unknown, api: ApiDispatch) => {
+  const id = object(saved).id;
+  if (id === undefined) return saved;
+  try { return await api(p, "GET", `/routines/${pathId(id)}`); } catch { return saved; }
 };
 const routineUrl = (p: McpPrincipal, id: unknown, origin: string) => origin + "/" + pathId(p.company.issuePrefix) + "/routines/" + pathId(id);
 const issueUrl = (p: McpPrincipal, id: unknown, origin: string) => origin + "/" + pathId(p.company.issuePrefix) + "/issues/" + pathId(id);
@@ -94,7 +103,8 @@ export const routineMcpCapabilities: Capability[] = [
     schema: z.object({ ...company, requestId, routine: newRoutine }).strict(),
     run: async (p, a, api, origin) => {
       const created = await api(p, "POST", `/companies/${pathId(a.companyId)}/routines`, object(a.routine));
-      return { routine: { ...routineOutput(created), url: routineUrl(p, object(created).id, origin) },
+      const routine = await settledRoutine(p, created, api);
+      return { routine: { ...routineOutput(routine), url: routineUrl(p, object(routine).id, origin) },
         scheduling: "A routine without an enabled schedule trigger never runs on its own. Add one with paperclip_add_routine_trigger." };
     },
   },
@@ -102,7 +112,11 @@ export const routineMcpCapabilities: Capability[] = [
     name: "paperclip_update_routine", configure: true, destructive: true,
     description: "Change a routine's title, description, assigned agent, project, priority, concurrency or status, including pausing (status paused) and resuming (status active). Requires configuration consent. Supply baseRevisionId from paperclip_get_routine so a routine changed in Paperclip meanwhile is not overwritten. This does not edit triggers; use the trigger tools.",
     schema: z.object({ ...routine, requestId, changes: routineChanges }).strict(),
-    run: async (p, a, api, origin) => ({ routine: { ...routineOutput(await api(p, "PATCH", `/routines/${pathId(a.routineId)}`, object(a.changes))), url: routineUrl(p, a.routineId, origin) } }),
+    run: async (p, a, api, origin) => {
+      const saved = await api(p, "PATCH", `/routines/${pathId(a.routineId)}`, object(a.changes));
+      const routine = await settledRoutine(p, saved, api);
+      return { routine: { ...routineOutput(routine), url: routineUrl(p, a.routineId, origin) } };
+    },
   },
   {
     name: "paperclip_add_routine_trigger", configure: true,
@@ -144,7 +158,6 @@ export const routineMcpCapabilities: Capability[] = [
     run: async (p, a, api, origin) => {
       const run = await api(p, "POST", `/routines/${pathId(a.routineId)}/run`, {
         source: "manual",
-        ...(a.triggerId ? { triggerId: a.triggerId } : {}),
         ...(a.variables ? { variables: a.variables } : {}),
       });
       const linkedIssueId = object(run).linkedIssueId;

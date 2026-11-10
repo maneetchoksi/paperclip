@@ -49,6 +49,8 @@ describe("routine MCP capability registration", () => {
     expect(Object.keys(scheduleTrigger).sort()).toEqual(["cronExpression", "enabled", "label", "timezone"]);
     const createRoutine = (registered.get("paperclip_create_routine")!.schema.shape as Record<string, { shape?: Record<string, unknown> }>).routine.shape!;
     expect(Object.keys(createRoutine)).not.toEqual(expect.arrayContaining(["env"]));
+    // "Run now" is a manual run: it must not be able to name an integration-owned trigger.
+    expect(Object.keys(registered.get("paperclip_run_routine")!.schema.shape)).not.toContain("triggerId");
     // Webhook signing and public fire-URL fields are not assistant input.
     for (const shape of [scheduleTrigger, (registered.get("paperclip_update_routine_trigger")!.schema.shape as Record<string, { shape?: Record<string, unknown> }>).changes.shape!]) {
       expect(Object.keys(shape)).not.toEqual(expect.arrayContaining(["kind", "setupPending", "signingMode", "replayWindowSec", "archived"]));
@@ -125,6 +127,9 @@ describe.skipIf(!support.supported)("routine assistant tools", () => {
 
     const paused = await f.call("paperclip_update_routine", { routineId: routine.id, requestId: randomUUID(), changes: { status: "paused" } });
     expect(paused.routine).toMatchObject({ id: routine.id, status: "paused" });
+    // The update response must report the live schedule rather than imply the routine has none.
+    expect((paused.routine as { triggers: { id: string }[] }).triggers.map((candidate) => candidate.id)).toEqual([trigger.id]);
+    expect(paused.routine).toMatchObject({ triggers: [{ cronExpression: "0 9 * * 1" }], assignee: { id: f.agent.id } });
     expect((await db.select().from(routinesTable).where(eq(routinesTable.id, routine.id)))[0]?.status).toBe("paused");
     // A revision from before the pause is stale and must not overwrite the newer routine.
     const stale = await f.call("paperclip_update_routine", { routineId: routine.id, requestId: randomUUID(), changes: { title: "Stale title", baseRevisionId: routine.latestRevisionId } });
@@ -145,7 +150,8 @@ describe.skipIf(!support.supported)("routine assistant tools", () => {
     try {
       const f = await fixture();
       const routine = await createRoutine(f, "Daily triage");
-      const started = await f.call("paperclip_run_routine", { routineId: routine.id, requestId: randomUUID() });
+      const requestId = randomUUID();
+      const started = await f.call("paperclip_run_routine", { routineId: routine.id, requestId });
       const run = started.run as { id: string; source: string; status: string; linkedIssueId: string };
       expect(run).toMatchObject({ routineId: routine.id, source: "manual", status: "issue_created" });
       expect(run.linkedIssueId).toBeTruthy();
@@ -155,9 +161,14 @@ describe.skipIf(!support.supported)("routine assistant tools", () => {
       const [dispatched] = await db.select().from(issues).where(eq(issues.id, run.linkedIssueId));
       expect(dispatched).toMatchObject({ companyId: f.company.id, title: "Daily triage", assigneeAgentId: f.agent.id, status: "todo" });
       expect(await db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id))).toHaveLength(1);
-      // The same requestId replays the recorded receipt instead of dispatching a second run.
-      expect(await f.call("paperclip_get_routine", { routineId: routine.id }).then((v) => (v.routine as { recentRuns: unknown[] }).recentRuns)).toHaveLength(1);
+      // Replaying the same requestId returns the recorded receipt instead of dispatching a second run.
+      expect(await f.call("paperclip_run_routine", { routineId: routine.id, requestId })).toEqual(started);
+      expect(await db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id))).toHaveLength(1);
+      expect(await db.select().from(issues).where(eq(issues.companyId, f.company.id))).toHaveLength(1);
       expect(wake).toHaveBeenCalledTimes(1);
+      await expect(f.call("paperclip_run_routine", { routineId: routine.id, requestId, variables: { topic: "changed" } })).rejects.toThrow("different arguments");
+      expect(wake).toHaveBeenCalledTimes(1);
+      expect(await f.call("paperclip_get_routine", { routineId: routine.id }).then((v) => (v.routine as { recentRuns: unknown[] }).recentRuns)).toHaveLength(1);
     } finally { wake.mockRestore(); }
   });
 
@@ -198,6 +209,13 @@ describe.skipIf(!support.supported)("routine assistant tools", () => {
     expect(await f.call("paperclip_update_routine_trigger", { routineId: routine.id, triggerId: webhook!.id, requestId: randomUUID(), changes: { enabled: false } })).toMatchObject({ outcome: "rejected", status: 422 });
     expect(await f.call("paperclip_delete_routine_trigger", { routineId: routine.id, triggerId: webhook!.id, requestId: randomUUID() })).toMatchObject({ outcome: "rejected", status: 422 });
     expect((await db.select().from(routineTriggersTable).where(eq(routineTriggersTable.id, webhook!.id)))[0]?.enabled).toBe(true);
+    // A webhook-shaped input cannot create a second, integration-owned trigger on the same routine.
+    await expect(f.call("paperclip_add_routine_trigger", { routineId: routine.id, requestId: randomUUID(), trigger: { kind: "webhook", cronExpression: "0 9 * * 1" } })).rejects.toThrow();
+    expect(await db.select().from(routineTriggersTable).where(eq(routineTriggersTable.routineId, routine.id))).toHaveLength(2);
+    // Run-now cannot target a trigger at all, so an integration trigger's delivery state is never stamped.
+    await expect(f.call("paperclip_run_routine", { routineId: routine.id, requestId: randomUUID(), triggerId: webhook!.id })).rejects.toThrow();
+    expect((await db.select().from(routineTriggersTable).where(eq(routineTriggersTable.id, webhook!.id)))[0]?.lastFiredAt).toBeNull();
+    expect(await db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id))).toHaveLength(0);
 
     const detail = await f.call("paperclip_get_routine", { routineId: routine.id });
     const detailTriggers = (detail.routine as { triggers: { id: string; kind: string; cronExpression: string }[] }).triggers;
