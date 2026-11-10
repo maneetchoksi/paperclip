@@ -15,7 +15,7 @@ export class McpApiError extends Error {
 /** Messages intentionally safe to return across the public tool boundary. */
 export class McpCapabilityError extends Error {}
 
-export type ApiDispatch = (principal: McpPrincipal, method: "GET" | "POST" | "PATCH" | "PUT", path: string, body?: unknown) => Promise<unknown>;
+export type ApiDispatch = (principal: McpPrincipal, method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE", path: string, body?: unknown) => Promise<unknown>;
 
 export const company = { companyId: z.uuid().describe("The company explicitly authorized by this connection. Copy the exact companyId from paperclip_connection and wait for that result before dependent tool calls. Never guess an ID or use a placeholder.") };
 export const task = { ...company, taskId: z.uuid().describe("The exact task UUID returned by paperclip_search_tasks or paperclip_create_task. Search by title or human-readable identifier first; never derive a UUID from a title or identifier.") };

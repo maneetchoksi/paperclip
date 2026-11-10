@@ -67,10 +67,6 @@ const settledRoutine = async (p: McpPrincipal, saved: unknown, api: ApiDispatch)
 const routineUrl = (p: McpPrincipal, id: unknown, origin: string) => origin + "/" + pathId(p.company.issuePrefix) + "/routines/" + pathId(id);
 const issueUrl = (p: McpPrincipal, id: unknown, origin: string) => origin + "/" + pathId(p.company.issuePrefix) + "/issues/" + pathId(id);
 const scheduleCron = (timezone: unknown) => typeof timezone === "string" && timezone ? timezone : "UTC";
-/** The internal dispatch forwards the method straight to the REST router, which serves
- * DELETE /routine-triggers/:id; only the shared ApiDispatch method union omits DELETE. */
-const dispatchDelete = (api: ApiDispatch, p: McpPrincipal, path: string) =>
-  (api as unknown as (principal: McpPrincipal, method: "DELETE", path: string) => Promise<unknown>)(p, "DELETE", path);
 
 /** Trigger routes take only a trigger id, so resolve ownership through its routine first. */
 async function ownedScheduleTrigger(p: McpPrincipal, a: Record<string, unknown>, api: ApiDispatch) {
@@ -147,7 +143,7 @@ export const routineMcpCapabilities: Capability[] = [
     schema: z.object({ ...routineTrigger, requestId }).strict(),
     run: async (p, a, api) => {
       await ownedScheduleTrigger(p, a, api);
-      await dispatchDelete(api, p, `/routine-triggers/${pathId(a.triggerId)}`);
+      await api(p, "DELETE", `/routine-triggers/${pathId(a.triggerId)}`);
       return { deleted: true, routineId: a.routineId, triggerId: a.triggerId };
     },
   },
