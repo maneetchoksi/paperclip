@@ -9,8 +9,8 @@ import { unprocessable } from "../../errors.js";
  */
 export const MCP_AGENT_HARNESSES = ["codex_local", "claude_local", "pi_local"] as const;
 
-/** Pi keeps its reasoning level in `thinking` and accepts the same levels for every model. */
-const PI_LOCAL_THINKING_LEVELS: readonly string[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+/** Pi keeps its reasoning level in `thinking`; the Pi CLI accepts these levels for every model. */
+const PI_LOCAL_THINKING_LEVELS: readonly string[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 function effortSettings(adapterType: string, config: Record<string, unknown>) {
   if (adapterType === "codex_local" || (adapterType === "paperclip_runner" && (config.provider ?? "codex") === "codex")) {

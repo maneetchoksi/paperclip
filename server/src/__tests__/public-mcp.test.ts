@@ -855,8 +855,14 @@ describe.skipIf(!support.supported)("public MCP OAuth and tool boundary", () => 
       expect(storedPi.adapterConfig.thinking).toBe("high");
       expect(storedPi.adapterConfig.reasoningEffort).toBeUndefined();
       expect(await f.call("paperclip_get_agent", { agentId: piAgentId })).toMatchObject({
-        agent: { adapterType: "pi_local", adapterConfig: { model: piModel, reasoningEffort: "high", supportedReasoningEfforts: ["off", "minimal", "low", "medium", "high", "xhigh"] } },
+        agent: { adapterType: "pi_local", adapterConfig: { model: piModel, reasoningEffort: "high", supportedReasoningEfforts: ["off", "minimal", "low", "medium", "high", "xhigh", "max"] } },
       });
+      // Pi's top thinking level is reachable through the neutral effort.
+      const maxHire = (await f.call("paperclip_create_agent", { requestId: randomUUID(), agent: { name: "Pi max", role: "engineer", adapterType: "pi_local", adapterConfig: { model: piModel, reasoningEffort: "max" } } })).agent as { id: string };
+      expect((await db.select().from(agents).where(eq(agents.id, maxHire.id)))[0]!.adapterConfig.thinking).toBe("max");
+      // Pi has no default model, so a Pi hire without one is refused instead of creating a dead agent.
+      expect(await f.call("paperclip_create_agent", { requestId: randomUUID(), agent: { name: "No model", adapterType: "pi_local" } })).toMatchObject({ outcome: "rejected", status: 422, code: "MCP_AGENT_MODEL_REQUIRED" });
+      expect(await db.select().from(agents).where(eq(agents.name, "No model"))).toHaveLength(0);
 
       const skill = (await f.call("paperclip_create_skill", { requestId: randomUUID(), skill: { name: "Deep research", slug: "deep-research", markdown: "# Deep research" } })).skill as { key: string };
       const claude = (await f.call("paperclip_create_agent", { requestId: randomUUID(), agent: { name: "Claude analyst", role: "researcher", adapterType: "claude_local", adapterConfig: { model: "claude-sonnet-4-5", reasoningEffort: "high" }, desiredSkills: ["deep-research"] } })).agent as { id: string; desiredSkills: string[] };
@@ -883,6 +889,16 @@ describe.skipIf(!support.supported)("public MCP OAuth and tool boundary", () => 
         await expect(f.call("paperclip_update_agent", { agentId: claude.id, requestId: randomUUID(), changes }), JSON.stringify(changes)).rejects.toThrow();
       }
       expect((await db.select().from(agents).where(eq(agents.id, claude.id)))[0]!.adapterConfig.cwd).toBe("/tmp/old-claude-workspace");
+
+      // Naming the harness the agent already uses is not a switch: adapterType never reaches the
+      // PATCH body, so no adapter configuration is re-derived or re-saved for a no-op.
+      const agentUpdates = async () => (await db.select().from(activityLog).where(eq(activityLog.entityId, claude.id)))
+        .filter(row => row.action === "agent.updated")
+        .sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime());
+      const sameHarness = await f.call("paperclip_update_agent", { agentId: claude.id, requestId: randomUUID(), changes: { adapterType: "pi_local", title: "Pi analyst" } });
+      expect(sameHarness, JSON.stringify(sameHarness)).toMatchObject({ agent: { title: "Pi analyst", adapterType: "pi_local", adapterConfig: { model: piModel, reasoningEffort: "xhigh" } } });
+      expect((await agentUpdates()).at(-1)!.details).toMatchObject({ changedTopLevelKeys: ["title"] });
+      expect((await db.select().from(agents).where(eq(agents.id, claude.id)))[0]!.adapterConfig).toMatchObject({ model: piModel, thinking: "xhigh" });
 
       // A switch needs the new harness model in the same call.
       expect(await f.call("paperclip_update_agent", { agentId: claude.id, requestId: randomUUID(), changes: { adapterType: "codex_local" } })).toMatchObject({ outcome: "rejected", status: 422, code: "MCP_HARNESS_SWITCH_MODEL_REQUIRED" });

@@ -78,7 +78,12 @@ function desiredSkillKeys(config: Record<string, unknown>) {
 async function harnessSwitch(p: McpPrincipal, agentId: unknown, changes: Record<string, unknown>, api: ApiDispatch) {
   const current = object(await api(p, "GET", `/agents/${pathId(agentId)}/configuration`));
   const currentType = String(current.adapterType ?? "");
-  if (String(changes.adapterType) === currentType) return changes;
+  if (String(changes.adapterType) === currentType) {
+    // Naming the harness the agent already uses is not a change: leave adapterType out so the
+    // route does not re-derive and re-save the adapter configuration for a no-op.
+    const { adapterType: _unchanged, ...rest } = changes;
+    return rest;
+  }
   if (!(MCP_AGENT_HARNESSES as readonly string[]).includes(currentType)) {
     throw new McpApiError(422, { code: "MCP_HARNESS_SWITCH_UNSUPPORTED", currentAdapterType: currentType });
   }
@@ -167,16 +172,22 @@ export const expandedMcpCapabilities: Capability[] = [
     schema: z.object({ ...agent, requestId, changes: nonempty(agentChanges) }).strict(), run: async (p, a, api) => {
       const changes = object(a.changes);
       const patch = changes.adapterType === undefined ? changes : await harnessSwitch(p, a.agentId, changes, api);
+      // Naming only the harness the agent already uses asks for no change at all.
+      if (Object.keys(patch).length === 0) return { agent: agentOutput(await api(p, "GET", `/agents/${pathId(a.agentId)}/configuration`)) };
       return { agent: agentOutput(await api(p, "PATCH", `/agents/${pathId(a.agentId)}`, patch)) };
     },
   },
   {
     name: "paperclip_create_agent", configure: true,
-    description: "Hire a new agent with a role, reporting line (reportsTo puts it in a manager's team), skills (keys or slugs from paperclip_list_skills or paperclip_import_skills), model, reasoning effort, harness (adapterType: codex_local, claude_local or pi_local), budget and an existing AI connection. Requires configuration consent and normal agent-creation permission. If the company requires board approval for new agents, this creates a pending hire approval that must be decided in Paperclip before the agent can run. Set instructions afterwards with paperclip_update_agent_instructions.",
+    description: "Hire a new agent with a role, reporting line (reportsTo puts it in a manager's team), skills (keys or slugs from paperclip_list_skills or paperclip_import_skills), model, reasoning effort, harness (adapterType: codex_local, claude_local or pi_local), budget and an existing AI connection. Pi agents need adapterConfig.model because Pi has no default model. Requires configuration consent and normal agent-creation permission. If the company requires board approval for new agents, this creates a pending hire approval that must be decided in Paperclip before the agent can run. Set instructions afterwards with paperclip_update_agent_instructions.",
     schema: z.object({ ...company, requestId, agent: agentHire }).strict(),
     run: async (p, a, api, origin) => {
       const { adapterConfig: requested = {}, ...hire } = object(a.agent);
       const model = object(requested).model;
+      // Pi has no runtime model default, so a Pi hire without a model would never run.
+      if (hire.adapterType === "pi_local" && (typeof model !== "string" || model.trim() === "")) {
+        throw new McpApiError(422, { code: "MCP_AGENT_MODEL_REQUIRED", adapterType: "pi_local" });
+      }
       let adapterConfig: Record<string, unknown>;
       try {
         // The hire route stores adapter-native fields; translate the neutral effort like PATCH does.
