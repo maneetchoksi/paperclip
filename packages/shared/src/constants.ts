@@ -974,6 +974,7 @@ export const HUMAN_COMPANY_MEMBERSHIP_ROLES = [
   "owner",
   "admin",
   "operator",
+  "client",
   "viewer",
 ] as const;
 export type HumanCompanyMembershipRole = (typeof HUMAN_COMPANY_MEMBERSHIP_ROLES)[number];
@@ -982,6 +983,7 @@ export const HUMAN_COMPANY_MEMBERSHIP_ROLE_LABELS: Record<HumanCompanyMembership
   owner: "Owner",
   admin: "Admin",
   operator: "Operator",
+  client: "Client",
   viewer: "Viewer",
 };
 

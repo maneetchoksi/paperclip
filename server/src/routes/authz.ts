@@ -3,6 +3,25 @@ import type { SecretBindingTargetType } from "@paperclipai/shared";
 import { forbidden, HttpError, unauthorized } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { responsibleUserAuthzShadowMode } from "../services/authorization.js";
+import { isClientHumanRole } from "../services/company-member-roles.js";
+
+/**
+ * A `client` membership may comment on tasks and message agents - nothing else.
+ * Route families are matched on the request URL because no permission key
+ * expresses "comments on any task in this company": `issue:comment` is one of
+ * the null-key actions decided by membership role alone, so the narrowing has
+ * to happen here rather than in the grant table.
+ */
+const CLIENT_WRITE_PATHS: RegExp[] = [
+  /^\/api\/issues\/[^/]+\/comments\/?$/,
+  /^\/api\/companies\/[^/]+\/chats\/[^/]+\/?$/,
+];
+
+function isClientWritePath(req: Request): boolean {
+  const url = req.originalUrl ?? req.url ?? "";
+  const path = url.split("?")[0]?.replace(/\/+$/, "") ?? "";
+  return CLIENT_WRITE_PATHS.some((pattern) => pattern.test(path));
+}
 
 function throwOrShadowResponsibleUserCompanyAccessDeny(
   req: Request,
@@ -115,6 +134,9 @@ export function assertCompanyAccess(req: Request, companyId: string) {
       }
       if (membership.membershipRole === "viewer") {
         throw forbidden("Viewer access is read-only");
+      }
+      if (isClientHumanRole(membership.membershipRole) && !isClientWritePath(req)) {
+        throw forbidden("Client access is limited to comments and chat");
       }
     }
   }

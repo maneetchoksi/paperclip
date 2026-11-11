@@ -1270,9 +1270,10 @@ type CompanyMemberRecord = Awaited<ReturnType<typeof loadCompanyMemberRecords>>[
 
 const humanRoleRank: Record<HumanCompanyMembershipRole, number> = {
   viewer: 1,
-  operator: 2,
-  admin: 3,
-  owner: 4,
+  client: 2,
+  operator: 3,
+  admin: 4,
+  owner: 5,
 };
 
 async function resolveActorHumanRole(
