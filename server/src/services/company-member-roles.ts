@@ -5,8 +5,28 @@ const HUMAN_COMPANY_MEMBERSHIP_ROLES: HumanCompanyMembershipRole[] = [
   "owner",
   "admin",
   "operator",
+  "client",
   "viewer",
 ];
+
+/**
+ * A `client` is a member of a company we run for them: they read, comment and
+ * chat, and nothing else. Kept as predicates because three layers need the
+ * same answer - the route write gate, the authorization service and the
+ * invite defaults.
+ */
+export function isClientHumanRole(
+  role: string | null | undefined
+): boolean {
+  return role === "client";
+}
+
+/** Roles that must not take task or run actions: `viewer` and `client`. */
+export function isCommentOnlyHumanRole(
+  role: string | null | undefined
+): boolean {
+  return isClientHumanRole(role) || role === "viewer";
+}
 
 export function normalizeHumanRole(
   value: unknown,
@@ -71,6 +91,11 @@ export function grantsForHumanRole(
         { permissionKey: "tools:view_audit", scope: null },
         { permissionKey: "audit:view_agent_actions", scope: null },
       ];
+    case "client":
+      // Comment, chat, read and use tools that were already granted. Agent
+      // configuration, environments, invites and tool administration stay with
+      // the operator: the execution boundary depends on it.
+      return [{ permissionKey: "tools:use", scope: null }];
     case "viewer":
       return [];
   }

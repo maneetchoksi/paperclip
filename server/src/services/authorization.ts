@@ -46,7 +46,7 @@ import {
 } from "./trust-preset-resolver.js";
 import { logger } from "../middleware/logger.js";
 import { normalizeAgentPermissions } from "../lib/agent-permissions.js";
-import { grantsForHumanRole, normalizeHumanRole } from "./company-member-roles.js";
+import { grantsForHumanRole, isClientHumanRole, isCommentOnlyHumanRole, normalizeHumanRole } from "./company-member-roles.js";
 
 export type AuthorizationActor =
   {
@@ -1933,7 +1933,7 @@ export function authorizationService(db: Db | DbTransaction) {
         const policyDeny = await denyForAssignmentPolicyIfNeeded(policyEffect);
         if (policyDeny) return policyDeny;
         const membership = await getActiveMembership(companyId, "user", input.actor.userId);
-        if (policyEffect.kind === "none" && membership && membership.membershipRole !== "viewer") {
+        if (policyEffect.kind === "none" && membership && !isCommentOnlyHumanRole(membership.membershipRole)) {
           return allow({
             action: input.action,
             reason: "allow_simple_company_member",
@@ -1972,7 +1972,10 @@ export function authorizationService(db: Db | DbTransaction) {
             });
           }
           const membership = await getActiveMembership(companyId, "user", input.actor.userId);
-          if (membership && membership.membershipRole !== "viewer") {
+          // A `client` membership comments and chats but never mutates tasks.
+          const clientMayAct =
+            input.action === "issue:comment" || !isClientHumanRole(membership?.membershipRole);
+          if (membership && membership.membershipRole !== "viewer" && clientMayAct) {
             return allow({
               action: input.action,
               reason: "allow_simple_company_member",
@@ -1983,7 +1986,9 @@ export function authorizationService(db: Db | DbTransaction) {
             return deny({
               action: input.action,
               reason: "deny_missing_grant",
-              explanation: `Viewer membership does not grant ${input.action}.`,
+              explanation: isClientHumanRole(membership.membershipRole)
+                ? `Client membership does not grant ${input.action}.`
+                : `Viewer membership does not grant ${input.action}.`,
             });
           }
           return deny({
@@ -2014,7 +2019,12 @@ export function authorizationService(db: Db | DbTransaction) {
             input.action === "secrets:read" ||
             input.action === "decision_queue:manage" ||
             input.action === "decision_triage:manage";
-          if (membership && (!requiresNonViewer || membership.membershipRole !== "viewer")) {
+          // Clients read, but they neither operate runs nor touch secrets.
+          const roleAllows =
+            requiresNonViewer
+              ? !isCommentOnlyHumanRole(membership?.membershipRole)
+              : !(isClientHumanRole(membership?.membershipRole) && input.action === "secrets:propose");
+          if (membership && roleAllows) {
             return allow({
               action: input.action,
               reason: "allow_simple_company_member",
@@ -2025,7 +2035,9 @@ export function authorizationService(db: Db | DbTransaction) {
             return deny({
               action: input.action,
               reason: "deny_missing_grant",
-              explanation: `Viewer membership does not grant ${input.action}.`,
+              explanation: isClientHumanRole(membership.membershipRole)
+                ? `Client membership does not grant ${input.action}.`
+                : `Viewer membership does not grant ${input.action}.`,
             });
           }
           return deny({
