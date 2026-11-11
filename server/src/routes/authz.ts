@@ -13,8 +13,14 @@ import { isClientHumanRole } from "../services/company-member-roles.js";
  * to happen here rather than in the grant table.
  */
 const CLIENT_WRITE_PATHS: RegExp[] = [
+  // Commenting on a task and sending a chat message both land here.
   /^\/api\/issues\/[^/]+\/comments\/?$/,
+  // Opening a chat with an agent.
   /^\/api\/companies\/[^/]+\/chats\/[^/]+\/?$/,
+  // Attachment upload on a task or chat the client can see.
+  /^\/api\/companies\/[^/]+\/issues\/[^/]+\/attachments\/?$/,
+  // The client's own read state. Reading a task in the UI marks it read.
+  /^\/api\/issues\/[^/]+\/read\/?$/,
 ];
 
 function isClientWritePath(req: Request): boolean {

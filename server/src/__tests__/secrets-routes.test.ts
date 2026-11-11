@@ -1039,6 +1039,37 @@ describe("secret routes", () => {
     );
   });
 
+  describe("GET /companies/:companyId/secrets", () => {
+    it("refuses a membership that holds no secrets:read grant", async () => {
+      mockSecretService.list.mockResolvedValue([]);
+      mockAccessService.decide.mockResolvedValue({
+        allowed: false,
+        reason: "deny_missing_grant",
+        explanation: "Client membership does not grant secrets:read.",
+      });
+
+      const res = await request(createApp({
+        type: "board",
+        userId: "client-1",
+        source: "session",
+        companyIds: ["company-1"],
+        memberships: [{ companyId: "company-1", status: "active", membershipRole: "client" }],
+      })).get("/api/companies/company-1/secrets");
+
+      expect(res.status).toBe(403);
+      expect(mockSecretService.list).not.toHaveBeenCalled();
+    });
+
+    it("returns the secret rows when the caller may read them", async () => {
+      mockSecretService.list.mockResolvedValue([{ id: "secret-1", name: "MY_API_KEY" }]);
+
+      const res = await request(createApp()).get("/api/companies/company-1/secrets");
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual([{ id: "secret-1", name: "MY_API_KEY" }]);
+    });
+  });
+
   describe("GET /companies/:companyId/secrets/catalog", () => {
     const fullSecrets = [
       {

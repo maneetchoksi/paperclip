@@ -595,6 +595,10 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
     assertBoard(req);
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    // Secret metadata names every credential the company holds; keep it behind
+    // the same action as the catalog so a client membership (comment and chat
+    // only) cannot enumerate it.
+    await assertSecretCatalogReadAllowed(req, companyId);
     const secrets = await svc.list(companyId);
     res.json(secrets);
   });
