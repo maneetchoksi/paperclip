@@ -104,11 +104,14 @@ describe("client write gate", () => {
   });
 
   it("lets a client comment and open or message a chat", () => {
-    for (const url of [
-      "/api/issues/issue-1/comments",
-      "/api/companies/company-1/chats/lead",
-    ]) {
-      expect(() => assertCompanyAccess(makeReq({ method: "POST", url }), "company-1"))
+    for (const [method, url] of [
+      ["POST", "/api/issues/issue-1/comments"],
+      ["POST", "/api/companies/company-1/chats/lead"],
+      ["POST", "/api/companies/company-1/issues/issue-1/attachments"],
+      ["POST", "/api/issues/issue-1/read"],
+      ["DELETE", "/api/issues/issue-1/read"],
+    ] as const) {
+      expect(() => assertCompanyAccess(makeReq({ method, url }), "company-1"))
         .not.toThrow();
     }
   });
@@ -122,7 +125,10 @@ describe("client write gate", () => {
       ["POST", "/api/companies/company-1/issues"],
       ["DELETE", "/api/issues/issue-1"],
       ["POST", "/api/companies/company-1/tool-connections"],
+      ["POST", "/api/companies/company-1/tools/connections"],
       ["POST", "/api/companies/company-1/secrets"],
+      ["POST", "/api/companies/company-1/routines"],
+      ["POST", "/api/issues/issue-1/comments/comment-1/reactions"],
     ];
     for (const [method, url] of cases) {
       expect(() => assertCompanyAccess(makeReq({ method, url }), "company-1"))
